@@ -1,7 +1,6 @@
 import os
-import json
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -18,14 +17,30 @@ load_dotenv()
 
 app = FastAPI(title="Mail-chan AI Email Replier")
 
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY", "change-this-secret"))
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+IS_PRODUCTION = FRONTEND_URL.startswith("https")
+
+# SessionMiddleware must be added BEFORE CORSMiddleware.
+# https_only=True marks the cookie as Secure, required in production (HTTPS).
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SECRET_KEY", "change-this-secret"),
+    same_site="lax",
+    https_only=IS_PRODUCTION,
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000",
+        FRONTEND_URL,                        # pulls https://mailchan.onrender.com from env
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ── Request Models ─────────────────────────────────────────────────────────────
 
@@ -70,8 +85,11 @@ class ClassifyAllRequest(BaseModel):
 
 @app.get("/api/auth/login")
 async def login(request: Request):
-    auth_url, state = get_auth_url()
+    auth_url, state, code_verifier = get_auth_url()   # unpack 3-tuple
     request.session["oauth_state"] = state
+    # Persist the PKCE verifier so the callback can send it to Google.
+    # Storing None is harmless — exchange_code_for_token handles it gracefully.
+    request.session["code_verifier"] = code_verifier
     return RedirectResponse(auth_url)
 
 
@@ -80,17 +98,18 @@ async def auth_callback(request: Request, code: str, state: str):
     saved_state = request.session.get("oauth_state")
     if state != saved_state:
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
-    token_data = exchange_code_for_token(code)
+
+    code_verifier = request.session.get("code_verifier")   # restore from session
+    token_data = exchange_code_for_token(code, code_verifier)
+
     request.session["token"] = token_data
     request.session["authenticated"] = True
-    FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
     return RedirectResponse(url=FRONTEND_URL)
 
 
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
-    authenticated = request.session.get("authenticated", False)
-    if authenticated:
+    if request.session.get("authenticated"):
         try:
             service = get_gmail_service(request.session["token"])
             profile = service.users().getProfile(userId="me").execute()
@@ -126,7 +145,11 @@ async def draft_email_reply(request: Request, body: DraftRequest):
     if not request.session.get("authenticated"):
         raise HTTPException(status_code=401, detail="Not authenticated")
     email_data = body.dict()
-    reply = draft_reply(email_data=email_data, custom_instructions=body.instructions, user_name=body.user_name)
+    reply = draft_reply(
+        email_data=email_data,
+        custom_instructions=body.instructions,
+        user_name=body.user_name,
+    )
     if not reply:
         raise HTTPException(status_code=500, detail="Failed to generate reply")
     return {"reply": reply}
@@ -145,12 +168,11 @@ async def send_email_reply(request: Request, body: SendRequest):
             original_email=body.original_email,
             reply_body=body.reply_body,
             sender_email=user_email,
-            dry_run=body.dry_run
+            dry_run=body.dry_run,
         )
         if result is not None:
             return {"success": True, "message_id": result.get("id", "sent")}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to send reply")
+        raise HTTPException(status_code=500, detail="Failed to send reply")
     except HTTPException:
         raise
     except Exception as e:
@@ -161,13 +183,11 @@ async def send_email_reply(request: Request, body: SendRequest):
 
 @app.post("/api/classify")
 async def classify_single(request: Request, body: ClassifyRequest):
-    """Classify a single email and apply Gmail label."""
     if not request.session.get("authenticated"):
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         service = get_gmail_service(request.session["token"])
         email_data = body.dict()
-        # Map id field
         email_data["id"] = body.email_id
         category = classify_and_label(service, email_data)
         return {"email_id": body.email_id, "category": category}
@@ -177,7 +197,6 @@ async def classify_single(request: Request, body: ClassifyRequest):
 
 @app.post("/api/classify-all")
 async def classify_all(request: Request, body: ClassifyAllRequest):
-    """Classify a list of emails and apply Gmail labels to all."""
     if not request.session.get("authenticated"):
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
@@ -196,8 +215,7 @@ async def classify_all(request: Request, body: ClassifyAllRequest):
 
 
 @app.get("/api/labels")
-async def get_labels(request: Request):
-    """Returns the available label categories."""
+async def get_labels():
     return {"labels": LABELS}
 
 
