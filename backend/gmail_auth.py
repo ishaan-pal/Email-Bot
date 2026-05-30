@@ -1,5 +1,4 @@
 import os
-import json
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
@@ -15,37 +14,52 @@ SCOPES = [
 ]
 
 REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/api/auth/callback")
-CREDENTIALS_FILE = "/etc/secrets/credentials.json" if os.path.exists("/etc/secrets/credentials.json") else "credentials.json"
+CREDENTIALS_FILE = (
+    "/etc/secrets/credentials.json"
+    if os.path.exists("/etc/secrets/credentials.json")
+    else "credentials.json"
+)
 
 
 def get_auth_url():
     """
     Generates the Google OAuth2 authorization URL.
-    Returns (auth_url, state) tuple.
+    Returns (auth_url, state, code_verifier) tuple.
+    code_verifier will be None if the installed library version does not use PKCE.
     """
     flow = Flow.from_client_secrets_file(
         CREDENTIALS_FILE,
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
+        redirect_uri=REDIRECT_URI,
     )
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent"
+        prompt="consent",
     )
-    return auth_url, state
+    # google-auth-oauthlib silently generates a PKCE code_verifier on newer
+    # versions. We must persist it across the redirect so the callback can
+    # send it back to Google during token exchange.
+    code_verifier = getattr(flow, "code_verifier", None)
+    return auth_url, state, code_verifier
 
 
-def exchange_code_for_token(code: str) -> dict:
+def exchange_code_for_token(code: str, code_verifier: str | None = None) -> dict:
     """
-    Exchanges the OAuth authorization code for tokens.
-    Returns token data as a dict.
+    Exchanges the OAuth authorization code for access + refresh tokens.
+    code_verifier MUST be supplied if PKCE was used during get_auth_url().
     """
     flow = Flow.from_client_secrets_file(
         CREDENTIALS_FILE,
         scopes=SCOPES,
-        redirect_uri=REDIRECT_URI
+        redirect_uri=REDIRECT_URI,
     )
+
+    # Restore the verifier so Google accepts the exchange.
+    # Without this, Google returns: invalid_grant / Missing code verifier.
+    if code_verifier:
+        flow.code_verifier = code_verifier
+
     flow.fetch_token(code=code)
     creds = flow.credentials
 
@@ -61,8 +75,8 @@ def exchange_code_for_token(code: str) -> dict:
 
 def get_gmail_service(token_data: dict):
     """
-    Builds an authenticated Gmail service from stored token data.
-    Auto-refreshes expired tokens.
+    Builds an authenticated Gmail API service from stored token data.
+    Automatically refreshes expired access tokens.
     """
     creds = Credentials(
         token=token_data["token"],
@@ -73,7 +87,6 @@ def get_gmail_service(token_data: dict):
         scopes=token_data.get("scopes", SCOPES),
     )
 
-    # Refresh if expired
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
